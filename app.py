@@ -2,173 +2,208 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import datetime
-import re
 import plotly.graph_objects as go
+import datetime
 
-# ====================== CONFIG & STYLES ======================
-st.set_page_config(layout="wide", page_title="Institutional Valuation Engine", page_icon="🏛️")
+# ==========================================
+# 1. THE TERMINAL DESIGN (CSS)
+# ==========================================
+st.set_page_config(layout="wide", page_title="Stochastic Valuation Terminal", page_icon="🏛️")
+
 st.markdown("""
-<style>
-    .stMetric { background-color: rgba(240,242,246,0.5); padding: 10px; border-radius: 10px; }
-    .stTabs [data-baseweb=tab] { font-size: 1.1rem; }
-</style>
+    <style>
+        .stApp { background-color: #0e1117; color: #ffffff; }
+        [data-testid="stMetric"] {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            padding: 15px;
+            border-radius: 10px;
+        }
+        .stTabs [data-baseweb=tab] { font-weight: 600; font-size: 1.1rem; color: #8b949e; }
+        .stTabs [aria-selected="true"] { color: #58a6ff; border-bottom-color: #58a6ff; }
+    </style>
 """, unsafe_allow_html=True)
 
-# ====================== DATA SCRAPER ======================
+# ==========================================
+# 2. THE DATA INTELLIGENCE LAYER
+# ==========================================
 @st.cache_data(ttl=3600)
-def fetch_fundamentals(ticker):
-    stock = yf.Ticker(ticker)
-    info = stock.info
-    
-    # Aggressive fetching for Altman Z components
-    return {
-        "totalDebt": info.get("totalDebt", 0),
-        "totalCash": info.get("totalCash", 0),
-        "ebitda": info.get("ebitda", 1000),
-        "totalAssets": info.get("totalAssets", 10000),
-        "totalStockholderEquity": info.get("totalStockholderEquity", 5000),
-        "totalRevenue": info.get("totalRevenue", 10000),
-        "operatingIncome": info.get("operatingIncome", 1000),
-        "beta": info.get("beta", 1.0),
-        "interest_expense": info.get("interestExpense", 100),
-        "current_liabilities": info.get("totalCurrentLiabilities", 1000),
-        "retained_earnings": info.get("retainedEarnings", 500),
-        "sector": info.get("sector", "Unknown"),
-        "ticker": ticker,
-        "state_owned": 0
-    }
-
-@st.cache_data(ttl=120)
-def fetch_live_price(ticker):
+def fetch_global_data(ticker):
+    """Fetches any global ticker and scores the data quality."""
     try:
-        history = yf.Ticker(ticker).history(period="1d")
-        return round(history['Close'].iloc[-1], 2) if not history.empty else 0.0
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        bs = stock.balance_sheet
+        fin = stock.financials
+        
+        def safe_val(df, row, default=0.0):
+            try: return float(df.loc[row].iloc[0]) if not pd.isna(df.loc[row].iloc[0]) else default
+            except: return default
+
+        data = {
+            "name": info.get("longName", ticker),
+            "sector": info.get("sector", "Unknown"),
+            "total_debt": info.get("totalDebt", safe_val(bs, "Total Debt", 0.0)),
+            "cash": info.get("totalCash", safe_val(bs, "Cash And Cash Equivalents", 0.0)),
+            "ebitda": info.get("ebitda", safe_val(fin, "EBITDA", 1.0)),
+            "assets": info.get("totalAssets", safe_val(bs, "Total Assets", 1.0)),
+            "equity": info.get("totalStockholderEquity", safe_val(bs, "Stockholders Equity", 1.0)),
+            "revenue": info.get("totalRevenue", safe_val(fin, "Total Revenue", 1.0)),
+            "operating_income": info.get("operatingIncome", safe_val(fin, "Operating Income", 1.0)),
+            "beta": info.get("beta", 1.2 if ".CA" in ticker else 1.0),
+            "interest_expense": safe_val(fin, "Interest Expense", 1.0),
+            "retained_earnings": safe_get_retained_earnings(bs),
+            "current_liabilities": safe_val(bs, "Total Current Liabilities", 1.0),
+            "currency": info.get("currency", "USD")
+        }
+        
+        # Data Quality Score
+        zeros = sum(1 for v in data.values() if v == 0.0 or v == 1.0)
+        data['quality_score'] = int((1 - (zeros / len(data))) * 100)
+        return data
     except:
-        return 10.0 # Standard fallback
+        return None
 
-# ====================== MATH ENGINE ======================
-def calculate_results(fundamentals, price, macro, sims=5000):
-    ebitda = max(fundamentals['ebitda'], 1e-5)
-    debt = fundamentals['totalDebt']
-    if fundamentals.get('debt_denomination') == "USD":
+def safe_get_retained_earnings(bs):
+    for label in ["Retained Earnings", "Cumulative Retained Earnings"]:
+        try: return float(bs.loc[label].iloc[0])
+        except: continue
+    return 0.0
+
+# ==========================================
+# 3. THE STOCHASTIC ENGINE
+# ==========================================
+def run_stochastic_model(fund, macro, sims=5000):
+    # A. Solvency & Default Risk
+    ebitda = max(fund['ebitda'], 1e-5)
+    debt = fund['total_debt']
+    if macro['debt_denom'] == "USD" and macro['is_frontier']:
         debt *= (1 + macro['fx_friction'])
-
-    # Solvency math
-    icr = ebitda / max(fundamentals.get('interest_expense', 1e-5), 1e-5)
-    icr_penalty = 1.5 if icr < 1.5 else 1.0
-    qual_mult = {"Low": 0.8, "Medium": 1.0, "High": 1.4}[macro['qualitative_risk']]
-    state_mult = 0.5 if fundamentals['state_owned'] else 1.0
     
-    risk_score = ((debt - fundamentals['totalCash']) / ebitda) * icr_penalty * qual_mult * state_mult
-    p_default = 1 / (1 + np.exp(-0.35 * (risk_score - 4.5)))
+    # State-owned backing discount (V1 logic)
+    risk_mult = 0.5 if fund['is_state_owned'] else 1.0
+    qual_mult = {"Low": 0.8, "Medium": 1.0, "High": 1.4}[macro['qual_risk']]
+    
+    net_debt_ebitda = (debt - fund['cash']) / ebitda
+    icr_penalty = 1.5 if (ebitda / max(fund['interest_expense'], 1e-5)) < 1.5 else 1.0
+    
+    p_default = 1 / (1 + np.exp(-0.35 * (net_debt_ebitda * icr_penalty * qual_mult * risk_mult - 4.5)))
+    
+    # B. Altman Z (Frontier Variant)
+    z = (1.2 * (fund['cash'] - fund['current_liabilities']) / fund['assets'] +
+         1.4 * fund['retained_earnings'] / fund['assets'] +
+         3.3 * ebitda / fund['assets'] +
+         0.6 * fund['equity'] / (fund['assets'] - fund['equity']) +
+         1.0 * fund['revenue'] / fund['assets']) * (0.7 if fund['is_state_owned'] else 1.0)
 
-    # ROIC Monte Carlo
-    sim_infl = np.random.triangular(macro['infl_low'], macro['infl_mode'], macro['infl_high'], sims)
-    sim_roic = (fundamentals['operatingIncome'] * (1 - 0.20) / (1 + sim_infl)) / \
-               max(debt + fundamentals['totalStockholderEquity'] - fundamentals['totalCash'], 1e-5)
-
-    icc = macro['sovereign_yield'] + (fundamentals['beta'] * 0.08) * qual_mult
-
-    # Altman Z
-    z = (
-        1.2 * (fundamentals['totalCash'] - fundamentals['current_liabilities']) / max(fundamentals['totalAssets'], 1e-5) +
-        1.4 * (fundamentals['retained_earnings'] / max(fundamentals['totalAssets'], 1e-5)) +
-        3.3 * (ebitda / max(fundamentals['totalAssets'], 1e-5)) +
-        0.6 * (fundamentals['totalStockholderEquity'] / max(fundamentals['totalAssets'] - fundamentals['totalStockholderEquity'], 1e-5)) +
-        1.0 * (fundamentals['totalRevenue'] / max(fundamentals['totalAssets'], 1e-5))
-    ) * (0.7 if fundamentals['state_owned'] else 1.0)
-
+    # C. Monte Carlo ROIC (V1 Stochastic paths)
+    sim_infl = np.random.triangular(macro['inf_l'], macro['inf_m'], macro['inf_h'], sims)
+    sim_tax = np.random.uniform(0.15, 0.25, sims)
+    
+    invested_cap = max(debt + fund['equity'] - fund['cash'], 1e-5)
+    sim_roic = (fund['operating_income'] * (1 - sim_tax) / (1 + sim_infl)) / invested_cap
+    icc = macro['yield'] + (fund['beta'] * 0.08) * qual_mult
+    
     return {
-        "p_default": p_default,
-        "real_price": price * (1 - p_default * 0.75),
-        "p_roic_gt_icc": float((sim_roic > icc).mean()),
+        "p_def": p_default,
+        "fair_value": fund['price'] * (1 - p_default * (1 - macro['recovery'])),
+        "z_score": z,
+        "roic_array": sim_roic,
         "icc": icc,
-        "simulated_roic": sim_roic,
-        "altman_z": z
+        "value_creation_prob": float((sim_roic > icc).mean())
     }
 
-# ====================== UI ======================
-if "audit_log" not in st.session_state: st.session_state.audit_log = []
+# ==========================================
+# 4. THE INTERFACE (EASE OF USE)
+# ==========================================
+st.sidebar.title("🏛️ Terminal Settings")
 
-st.title("🏛️ Quantitative Equity Stress-Tester")
+# Global Ticker Logic
+ticker = st.sidebar.text_input("Global Search (Ticker)", value="COMI.CA").upper()
+is_frontier = ".CA" in ticker or st.sidebar.checkbox("Apply Frontier Market Logic", value=True)
 
-# Ticker Selection
-t_cols = st.columns(5)
-tickers = ["COMI.CA", "TMGH.CA", "ABUK.CA", "AAPL", "MSFT"]
-for i, t in enumerate(tickers):
-    if t_cols[i].button(t): st.session_state.ticker = t
-
-user_ticker = st.text_input("Search Ticker", value=st.session_state.get("ticker", "COMI.CA")).upper()
-
-# Macro Sidebar
-with st.sidebar:
-    st.header("Macro Inputs")
-    macro = {
-        "sovereign_yield": st.slider("Sovereign Yield %", 5.0, 40.0, 22.0) / 100,
-        "qualitative_risk": st.selectbox("Risk Overlay", ["Low", "Medium", "High"], index=1),
-        "infl_low": 0.15, "infl_mode": st.slider("Inflation (Mode) %", 10.0, 60.0, 30.0) / 100, "infl_high": 0.70,
-        "fx_friction": st.slider("FX Friction %", 0.0, 20.0, 2.0) / 100
-    }
+# Macro Inputs
+with st.sidebar.expander("Macro Environment", expanded=True):
+    m_yield = st.slider("Sovereign Yield %", 5.0, 45.0, 22.0 if is_frontier else 4.5) / 100
+    inf_m = st.slider("Shadow Inflation (Mode) %", 2.0, 60.0, 30.0 if is_frontier else 3.0) / 100
+    qual_risk = st.selectbox("Systemic Risk Overlay", ["Low", "Medium", "High"], index=1 if is_frontier else 0)
+    fx_fric = st.slider("FX Friction / Parallel Spread %", 0.0, 20.0, 1.5 if is_frontier else 0.0) / 100
+    recovery = st.slider("Estimated Recovery Rate %", 10.0, 90.0, 25.0) / 100
 
 # Fetch Data
-raw_data = fetch_fundamentals(user_ticker)
-price = fetch_live_price(user_ticker)
+raw = fetch_global_data(ticker)
+if not raw:
+    st.error(f"Ticker {ticker} not found. Ensure format is correct (e.g., AAPL or TMGH.CA)")
+    st.stop()
 
-# Fundamentals Overrides
-with st.expander("📝 Corporate Financial Overrides"):
+# Verification Metric
+st.title(f"{raw['name']} ({ticker})")
+st.caption(f"Sector: {raw['sector']} | Data Confidence: {raw['quality_score']}% | Base Currency: {raw['currency']}")
+
+# Data Overrides
+with st.expander("📝 Financial Ledger (Overrides)"):
     c1, c2, c3 = st.columns(3)
-    overrides = {}
-    overrides["totalDebt"] = c1.number_input("Total Debt", value=float(raw_data['totalDebt']))
-    overrides["totalCash"] = c1.number_input("Cash", value=float(raw_data['totalCash']))
-    overrides["ebitda"] = c2.number_input("EBITDA", value=float(raw_data['ebitda']))
-    overrides["operatingIncome"] = c2.number_input("Op. Income", value=float(raw_data['operatingIncome']))
-    overrides["totalAssets"] = c3.number_input("Total Assets", value=float(raw_data['totalAssets']))
-    overrides["totalStockholderEquity"] = c3.number_input("Equity", value=float(raw_data['totalStockholderEquity']))
-    overrides["state_owned"] = st.checkbox("State Backed?")
+    o_debt = c1.number_input("Total Debt", value=float(raw['total_debt']))
+    o_cash = c1.number_input("Total Cash", value=float(raw['cash']))
+    o_ebitda = c2.number_input("EBITDA", value=float(raw['ebitda']))
+    o_opinc = c2.number_input("Operating Income", value=float(raw['operating_income']))
+    o_assets = c3.number_input("Total Assets", value=float(raw['assets']))
+    o_equity = c3.number_input("Total Equity", value=float(raw['equity']))
+    is_state = st.checkbox("State-Backed Entity / Sovereign Support?", value=False)
+    debt_denom = st.radio("Debt Denom", ["Local Currency", "USD"], horizontal=True)
+
+# Run Engine
+price = round(yf.Ticker(ticker).history(period="1d")['Close'].iloc[-1], 2)
+active_fund = {
+    **raw, "total_debt": o_debt, "cash": o_cash, "ebitda": o_ebitda, 
+    "operating_income": o_opinc, "assets": o_assets, "equity": o_equity, 
+    "is_state_owned": is_state, "price": price
+}
+active_macro = {
+    "yield": m_yield, "inf_l": inf_m*0.6, "inf_m": inf_m, "inf_h": inf_m*1.5,
+    "qual_risk": qual_risk, "fx_friction": fx_fric, "debt_denom": debt_denom,
+    "is_frontier": is_frontier, "recovery": recovery
+}
+
+res = run_stochastic_model(active_fund, active_macro)
+
+# ==========================================
+# 5. THE PROFESSIONAL DASHBOARD
+# ==========================================
+tab1, tab2 = st.tabs(["📊 Stress-Test Analysis", "📈 Monte Carlo Distribution"])
+
+with tab1:
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Live Market Price", f"{price}")
+    k2.metric("Stochastic Fair Value", f"{res['fair_value']:.2f}", f"{(1-res['fair_value']/price)*-100:.1f}% Risk Adj")
+    k3.metric("Default Probability", f"{res['p_def']*100:.2f}%", "Watchlist" if res['p_def'] > 0.2 else "Stable")
+    k4.metric("Altman Z-Score", f"{res['z_score']:.2f}", "Distress" if res['z_score'] < 1.8 else "Safe")
+
+    # Radar Chart
+    risk_radar = {
+        "Solvency": min(100, res['z_score'] * 20),
+        "Efficiency": res['value_creation_prob'] * 100,
+        "Liquidity": min(100, (active_fund['cash']/active_fund['current_liabilities'])*50),
+        "Macro Strength": 100 - (active_macro['fx_friction']*500)
+    }
     
-    # Audit logging
-    for k, v in overrides.items():
-        if v != raw_data.get(k):
-            st.session_state.audit_log.append(f"{k} changed to {v}")
-    
-    fund_final = {**raw_data, **overrides}
-
-# Results
-res = calculate_results(fund_final, price, macro)
-
-# Dashboard Display
-st.divider()
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Live Market Price", f"{price:.2f}")
-k2.metric("Stress-Tested Fair Value", f"{res['real_price']:.2f}", f"{(1-res['real_price']/price)*-100:.1f}% Risk Adj")
-k3.metric("Default Probability", f"{res['p_default']*100:.2f}%", "Watchlist" if res['p_default'] > 0.2 else "Healthy")
-k4.metric("Altman Z-Score", f"{res['altman_z']:.2f}", "Distress" if res['altman_z'] < 1.8 else "Safe")
-
-# Charts
-st.markdown("### Visualization")
-chart_tab1, chart_tab2 = st.tabs(["Risk Radar", "ROIC Distribution"])
-
-with chart_tab1:
-    risk_scores = [
-        min(100, res['altman_z'] * 20),
-        res['p_roic_gt_icc'] * 100,
-        min(100, (fund_final['totalCash']/max(fund_final['totalAssets'],1e-5))*500),
-        100 - (macro['fx_friction']*200)
-    ]
     fig_radar = go.Figure(go.Scatterpolar(
-        r=risk_scores,
-        theta=['Solvency', 'Efficiency', 'Liquidity', 'Macro FX'],
-        fill='toself'
+        r=list(risk_radar.values()), theta=list(risk_radar.keys()), fill='toself',
+        marker=dict(color='#58a6ff')
     ))
+    fig_radar.update_layout(polar=dict(radialaxis=dict(visible=False), bgcolor="#161b22"), 
+                            paper_bgcolor="rgba(0,0,0,0)", height=400, showlegend=False)
     st.plotly_chart(fig_radar, use_container_width=True)
 
-with chart_tab2:
+with tab2:
+    st.markdown("#### Profitability vs. Hurdle Rate (5,000 Path Simulation)")
     fig_hist = go.Figure()
-    fig_hist.add_trace(go.Histogram(x=res['simulated_roic']*100, marker_color='#3366ff'))
-    fig_hist.add_vline(x=res['icc']*100, line_color="red", annotation_text="Cost of Capital")
+    fig_hist.add_trace(go.Histogram(x=res['roic_array']*100, marker_color='#238636', nbinsx=60))
+    fig_hist.add_vline(x=res['icc']*100, line_dash="dash", line_color="#f85149", 
+                       annotation_text=f"Cost of Capital ({res['icc']*100:.1f}%)")
+    fig_hist.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=400,
+                           xaxis=dict(title="Simulated ROIC (%)", gridcolor="#30363d"),
+                           yaxis=dict(gridcolor="#30363d"))
     st.plotly_chart(fig_hist, use_container_width=True)
-
-# Final Audit Log
-with st.expander("Audit Log"):
-    st.write(st.session_state.audit_log)
+    
+    st.info(f"**Insight:** This company creates positive economic value in **{res['value_creation_prob']*100:.1f}%** of modeled macroeconomic scenarios.")
