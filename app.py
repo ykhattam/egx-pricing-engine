@@ -24,11 +24,9 @@ EGX_DATABASE = {
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financials(ticker):
-    # 1. Check Offline Database First (Instant, 100% Accurate)
     if ticker.upper() in EGX_DATABASE:
         return EGX_DATABASE[ticker.upper()], "Offline Database (High Fidelity)"
     
-    # 2. Fallback to Yahoo for Global Stocks
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -56,7 +54,6 @@ def fetch_financials(ticker):
         }
         return data, "Yahoo Finance API (Low Fidelity for Frontier)"
     except Exception:
-        # 3. Emergency Fallback
         return {"sector": "Unknown", "total_debt": 1000, "cash": 500, "EBITDA": 500, "interest_expense": 50, "current_liabilities": 200, "assets": 5000, "retained_earnings": 100, "equity": 2000, "revenue": 1000, "operating_income": 200, "beta": 1.0, "live_price": 10.0}, "Emergency Fallback (Needs Manual Override)"
 
 # -------------------------------------------------------------------
@@ -84,7 +81,7 @@ def run_model(fund, macro):
     sim_roic = (fund['operating_income'] * (1 - sim_tax) / (1 + sim_infl)) / invested_cap
     icc = macro['yield'] + (fund['beta'] * 0.08)
     
-    real_price = fund['live_price'] * (1 - (p_default * 0.75)) # Assuming 25% recovery
+    real_price = fund['live_price'] * (1 - (p_default * 0.75)) 
     
     return {
         "p_default": p_default, "z_score": z_score, "real_price": real_price,
@@ -109,19 +106,33 @@ data_dict, source_note = fetch_financials(ticker)
 # --- MAIN DASHBOARD LAYOUT ---
 tab_dashboard, tab_data, tab_macro = st.tabs(["📊 Executive Dashboard", "🧮 Financial Statements (Edit)", "🌍 Macro & FX Stress Tests"])
 
-# --- TAB 2: FINANCIAL DATA EDITOR (Clean Excel-like Grid) ---
+# --- TAB 2: FINANCIAL DATA EDITOR (Fixed Mapping logic) ---
 with tab_data:
     st.info(f"**Data Source:** {source_note}. *Edit any cell directly below to update the model in real-time.*")
     
-    # Transform dict to DataFrame for clean editing
-    metrics_to_edit = ["total_debt", "cash", "EBITDA", "interest_expense", "current_liabilities", "assets", "retained_earnings", "equity", "revenue", "operating_income"]
-    df_fund = pd.DataFrame([{"Metric": k.replace("_", " ").title(), "Value (M)": float(data_dict[k])} for k in metrics_to_edit])
+    # Strictly map internal math keys to beautiful UI words
+    translation_dict = {
+        "total_debt": "Total Debt",
+        "cash": "Cash & Equivalents",
+        "EBITDA": "EBITDA", 
+        "interest_expense": "Interest Expense",
+        "current_liabilities": "Current Liabilities",
+        "assets": "Total Assets",
+        "retained_earnings": "Retained Earnings",
+        "equity": "Total Equity",
+        "revenue": "Total Revenue",
+        "operating_income": "Operating Income"
+    }
     
-    # The magical Streamlit Data Editor
+    # Build the Dataframe safely
+    df_fund = pd.DataFrame([{"Metric": display_name, "Value (M)": float(data_dict[internal_key])} 
+                            for internal_key, display_name in translation_dict.items()])
+    
     edited_df = st.data_editor(df_fund, use_container_width=True, hide_index=True, num_rows="fixed")
     
-    # Map edited data back to dictionary
-    active_fund = {row['Metric'].replace(" ", "_").lower(): row['Value (M)'] for _, row in edited_df.iterrows()}
+    # Reverse map back to exact math keys securely
+    reverse_translation = {v: k for k, v in translation_dict.items()}
+    active_fund = {reverse_translation[row['Metric']]: row['Value (M)'] for _, row in edited_df.iterrows()}
     active_fund['beta'] = data_dict['beta']
     active_fund['live_price'] = data_dict['live_price']
 
@@ -144,10 +155,8 @@ results = run_model(active_fund, macro_inputs)
 
 # --- TAB 1: EXECUTIVE DASHBOARD ---
 with tab_dashboard:
-    # Top Level KPIs
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     
-    # Logic for re-ordering based on Persona
     order = ["Price", "Valuation", "Default", "ZScore"] if persona == "Equity Analyst" else ["Default", "ZScore", "Valuation", "Price"]
     
     metrics = {
@@ -164,7 +173,6 @@ with tab_dashboard:
 
     st.divider()
 
-    # Visual Analytics - Native Plotly
     c1, c2 = st.columns([2, 1])
     
     with c1:
