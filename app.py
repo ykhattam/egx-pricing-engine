@@ -31,6 +31,9 @@ st.markdown(f"""
             border-radius: 8px;
             padding: 12px;
         }}
+        .risk-high {{ color: #ff7b72; }}
+        .risk-medium {{ color: #d29922; }}
+        .risk-low {{ color: #3fb950; }}
         .override-diff {{ font-size: 0.8rem; opacity: 0.7; }}
     </style>
 """, unsafe_allow_html=True)
@@ -39,6 +42,7 @@ st.markdown(f"""
 # 2. ROBUST DATA LAYER
 # ==========================================
 def to_float(val, default=0.0):
+    """Safely cast value to float, preventing NoneType crashes."""
     try:
         if val is None or pd.isna(val):
             return default
@@ -48,6 +52,7 @@ def to_float(val, default=0.0):
 
 @st.cache_data(ttl=3600)
 def search_ticker(query):
+    """Hits Yahoo Finance search API for instant ticker matching."""
     if not query or len(query) < 2: return []
     try:
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
@@ -59,6 +64,7 @@ def search_ticker(query):
 
 @st.cache_data(ttl=3600)
 def fetch_comprehensive_data(ticker):
+    """Fetches high-fidelity core financial metrics with statement fallbacks."""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -122,13 +128,15 @@ def fetch_comprehensive_data(ticker):
         nulls = sum(1 for v in raw_metrics.values() if v in (None, 0.0, 1.0))
         raw_metrics['quality_score'] = int((1 - (nulls / len(raw_metrics))) * 100)
         return raw_metrics
-    except:
+    except Exception as e:
+        st.error(f"Failed to fetch data: {str(e)}")
         return None
 
 # ==========================================
 # 3. VALUATION ENGINE
 # ==========================================
 def calculate_stochastic_metrics(d, m, sims=3000):
+    """Calculates all key risk-adjusted parameters and simulated returns."""
     ebitda = max(d['ebitda'], 1e-4)
     total_assets = max(d['total_assets'], 1e-4)
     equity = max(total_assets - d['total_debt'], 1e-4)
@@ -143,7 +151,7 @@ def calculate_stochastic_metrics(d, m, sims=3000):
     icr = ebitda / max(d['interest_expense'], 1e-4)
     icr_penalty = 1.5 if icr < 1.5 else 1.0
     qual_mult = {"Low": 0.8, "Medium": 1.0, "High": 1.4}[m['qual_risk']]
-    
+
     p_def = 1 / (1 + np.exp(-0.35 * (net_debt_ebitda * icr_penalty * qual_mult - 4.5)))
     p_def = np.clip(p_def, 0.0, 0.99)
 
@@ -160,7 +168,7 @@ def calculate_stochastic_metrics(d, m, sims=3000):
     sim_infl = np.random.triangular(m['inf_l'], m['inf_m'], m['inf_h'], sims)
     sim_tax = np.random.uniform(0.15, 0.25, sims)
     invested_cap = max(debt + equity - cash, 1e-4)
-    
+
     sim_roic = (d['operating_income'] * (1 - sim_tax) / (1 + sim_infl)) / invested_cap
     icc = m['yield'] + (d['beta'] * 0.08) * qual_mult
 
@@ -201,7 +209,7 @@ with st.sidebar:
     qual_risk = st.selectbox("Country Risk Level", ["Low", "Medium", "High"], index=1 if is_frontier else 0)
     m_rec = st.slider("Recovery Rate (%)", 10, 90, 25) / 100
 
-# Fetch the raw fundamental data first
+# Fetch data
 data = fetch_comprehensive_data(ticker)
 
 if data:
@@ -209,7 +217,7 @@ if data:
     st.markdown("### 📝 MODEL ASSUMPTIONS")
     with st.expander("Adjust Financial Ledger", expanded=True):
         c1, c2, c3 = st.columns(3)
-        
+
         def log_change(field, old, new):
             diff_pct = ((new - old) / old * 100) if old != 0 else 0
             st.session_state.audit_log.append({
@@ -236,7 +244,7 @@ if data:
             diff_html = log_change("EBITDA", data['ebitda'], o_ebitda)
             st.markdown(f"**EBITDA Adjusted:** {o_ebitda:,.0f} {diff_html}", unsafe_allow_html=True)
 
-    # Populate active variables based on adjustments
+    # Populate active variables
     active_fund = {
         **data,
         "total_debt": o_debt,
@@ -259,112 +267,9 @@ if data:
     # Execute risk model
     res = calculate_stochastic_metrics(active_fund, active_macro)
 
-    # --- ALERTS IN SIDEBAR (Safe evaluation order) ---
+    # --- ALERTS IN SIDEBAR ---
     with st.sidebar:
         st.markdown("---")
         st.subheader("🚨 ALERTS")
         if st.session_state.previous_results:
-            delta_fv = res['fair_value'] - st.session_state.previous_results['fair_value']
-            delta_pdef = res['p_def'] - st.session_state.previous_results['p_def']
-            if abs(delta_fv) > 1e-4:
-                st.warning(f"Fair Value Δ: {delta_fv:+.2f} {data['currency']}")
-            if abs(delta_pdef) > 0.01:
-                st.warning(f"Default Risk Δ: {delta_pdef*100:+.1f}%")
-
-    # --- RISK DASHBOARD ---
-    st.markdown("### 🛡️ RISK DASHBOARD")
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        prev_pdef = st.session_state.previous_results['p_def'] if st.session_state.previous_results else res['p_def']
-        st.metric(
-            "Default Risk",
-            f"{res['p_def']*100:.1f}%",
-            f"{(res['p_def'] - prev_pdef)*100:+.1f}%",
-            delta_color="inverse"
-        )
-    with k2:
-        st.metric(
-            "Z-Score",
-            f"{res['z_score']:.2f}",
-            "Safe Zone" if res['z_score'] > 2.6 else "Distressed",
-            delta_color="off"
-        )
-    with k3:
-        st.metric(
-            "Fair Value",
-            f"{res['fair_value']:,.2f} {data['currency']}",
-            f"{((res['fair_value']/data['price'])-1)*100:+.1f}% Relative",
-            delta_color="off"
-        )
-    with k4:
-        st.metric(
-            "Value Creation Prob.",
-            f"{res['value_creation_prob']*100:.1f}%",
-            None
-        )
-
-    # --- KEY METRICS ---
-    st.markdown("### 📊 KEY METRICS")
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Market Price", f"{data['price']:,} {data['currency']}")
-    with m2:
-        st.metric("P/E Ratio", f"{data['pe_ratio']:.1f}" if data['pe_ratio'] else "N/A")
-    with m3:
-        st.metric("Debt/Equity", f"{to_float(data['debt_equity']):.1f}%" if data['debt_equity'] else "N/A")
-    with m4:
-        st.metric("ROE", f"{to_float(data['roe'])*100:.1f}%" if data['roe'] else "N/A")
-
-    # --- TABS ---
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Multiples", "💰 Profitability", "📊 ROIC Simulation", "📖 Glossary"])
-    
-    with tab1:
-        col_t1, col_t2 = st.columns(2)
-        col_t1.metric(
-            "EV/EBITDA",
-            f"{data['ev_ebitda']:.1f}x" if data['ev_ebitda'] else "N/A",
-            None,
-            help="Enterprise Value / EBITDA"
-        )
-        col_t2.metric(
-            "Price/Sales",
-            f"{data['ps_ratio']:.2f}x" if data['ps_ratio'] else "N/A",
-            None
-        )
-        
-    with tab2:
-        col_p1, col_p2 = st.columns(2)
-        col_p1.metric("Return on Assets (ROA)", f"{to_float(data['roa'])*100:.1f}%")
-        col_p2.metric("EBITDA Margin", f"{to_float(data['ebitda_margin'])*100:.1f}%" if data['ebitda_margin'] else "N/A")
-
-    with tab3:
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(
-            x=res['roic_array']*100,
-            marker_color='#238636' if theme == 'Dark' else '#1f883d',
-            opacity=0.8
-        ))
-        fig.add_vline(x=res['icc']*100, line_dash="dash", line_color="#ff7b72", annotation_text="Cost of Capital")
-        fig.update_layout(
-            height=250,
-            margin=dict(l=0, r=0, t=10, b=0),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font_color="#8b949e"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab4:
-        st.write("""
-        *   **Default Risk**: Computed via net leverage ratios and emerging market debt structures.
-        *   **Value Creation Probability**: The percentage of simulated paths where Real ROIC exceeds the cost of capital.
-        """)
-        
-    # Store results for the next change interaction comparison
-    st.session_state.previous_results = res
-
-else:
-    st.error("No data resolved for this ticker. Modify your input query.")
-
-st.divider()
-st.caption(f"Sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            delta_fv = res['fair_value'] - st.session_state.previous_results['fair_val
