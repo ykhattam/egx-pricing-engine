@@ -31,9 +31,6 @@ st.markdown(f"""
             border-radius: 8px;
             padding: 12px;
         }}
-        .risk-high {{ color: #ff7b72; }}
-        .risk-medium {{ color: #d29922; }}
-        .risk-low {{ color: #3fb950; }}
         .override-diff {{ font-size: 0.8rem; opacity: 0.7; }}
     </style>
 """, unsafe_allow_html=True)
@@ -272,4 +269,183 @@ if data:
         st.markdown("---")
         st.subheader("🚨 ALERTS")
         if st.session_state.previous_results:
-            delta_fv = res['fair_value'] - st.session_state.previous_results['fair_val
+            delta_fv = res['fair_value'] - st.session_state.previous_results['fair_value']
+            delta_pdef = res['p_def'] - st.session_state.previous_results['p_def']
+            if abs(delta_fv) > 1e-4:
+                st.warning(f"Fair Value Δ: {delta_fv:+.2f} {data['currency']}")
+            if abs(delta_pdef) > 0.01:
+                st.warning(f"Default Risk Δ: {delta_pdef*100:+.1f}%")
+
+    # --- RISK DASHBOARD ---
+    st.markdown("### 🛡️ RISK DASHBOARD")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        prev_pdef = st.session_state.previous_results['p_def'] if st.session_state.previous_results else res['p_def']
+        st.metric(
+            "Default Risk",
+            f"{res['p_def']*100:.1f}%",
+            f"{(res['p_def'] - prev_pdef)*100:+.1f}%",
+            delta_color="inverse"
+        )
+    with k2:
+        st.metric(
+            "Z-Score",
+            f"{res['z_score']:.2f}",
+            "Safe Zone" if res['z_score'] > 2.6 else "Distressed",
+            delta_color="off"
+        )
+    with k3:
+        st.metric(
+            "Fair Value",
+            f"{res['fair_value']:,.2f} {data['currency']}",
+            f"{((res['fair_value']/data['price'])-1)*100:+.1f}% Relative",
+            delta_color="off"
+        )
+    with k4:
+        st.metric(
+            "Value Creation Prob.",
+            f"{res['value_creation_prob']*100:.1f}%",
+            None
+        )
+
+    # --- KEY METRICS ---
+    st.markdown("### 📊 KEY METRICS")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Market Price", f"{data['price']:,} {data['currency']}")
+    with m2:
+        st.metric("P/E Ratio", f"{data['pe_ratio']:.1f}" if data['pe_ratio'] else "N/A")
+    with m3:
+        st.metric("Debt/Equity", f"{to_float(data['debt_equity']):.1f}x" if data['debt_equity'] else "N/A")
+    with m4:
+        st.metric("ROE", f"{to_float(data['roe'])*100:.1f}%" if data['roe'] else "N/A")
+
+    # --- TABS ---
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Multiples", "💰 Profitability", "📊 ROIC Simulation", "📖 Glossary"])
+
+    with tab1:
+        col_t1, col_t2 = st.columns(2)
+        col_t1.metric(
+            "EV/EBITDA",
+            f"{data['ev_ebitda']:.1f}x" if data['ev_ebitda'] else "N/A",
+            None,
+            help="Enterprise Value / EBITDA"
+        )
+        col_t2.metric(
+            "Price/Sales",
+            f"{data['ps_ratio']:.2f}x" if data['ps_ratio'] else "N/A",
+            None,
+            help="Price to Sales Ratio"
+        )
+        col_t1.metric(
+            "Price/Book",
+            f"{data['pb_ratio']:.2f}x" if data['pb_ratio'] else "N/A",
+            None,
+            help="Price to Book Ratio"
+        )
+        col_t2.metric(
+            "Dividend Yield",
+            f"{to_float(data['dividend_yield'])*100:.1f}%" if data['dividend_yield'] else "0.0%",
+            None,
+            help="Annual Dividend Yield"
+        )
+
+    with tab2:
+        col_p1, col_p2 = st.columns(2)
+        col_p1.metric(
+            "Return on Assets (ROA)",
+            f"{to_float(data['roa'])*100:.1f}%",
+            None,
+            help="Net Income / Total Assets"
+        )
+        col_p2.metric(
+            "EBITDA Margin",
+            f"{to_float(data['ebitda_margin'])*100:.1f}%" if data['ebitda_margin'] else "N/A",
+            None,
+            help="EBITDA / Revenue"
+        )
+        col_p1.metric(
+            "Profit Margin",
+            f"{to_float(data['profit_margin'])*100:.1f}%" if data['profit_margin'] else "N/A",
+            None,
+            help="Net Income / Revenue"
+        )
+        col_p2.metric(
+            "Return on Equity (ROE)",
+            f"{to_float(data['roe'])*100:.1f}%" if data['roe'] else "N/A",
+            None,
+            help="Net Income / Shareholder Equity"
+        )
+
+    with tab3:
+        st.markdown("#### Return on Invested Capital Simulation")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(
+            x=res['roic_array']*100,
+            marker_color='#238636' if theme == 'Dark' else '#1f883d',
+            opacity=0.8,
+            name="Simulated ROIC"
+        ))
+        fig.add_vline(
+            x=res['icc']*100,
+            line_dash="dash",
+            line_color="#ff7b72",
+            annotation_text=f"Cost of Capital ({res['icc']*100:.1f}%)",
+            annotation_position="top right"
+        )
+        fig.update_layout(
+            height=300,
+            margin=dict(l=20, r=20, t=30, b=20),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#8b949e" if theme == 'Dark' else "#6e7781",
+            xaxis_title="Real ROIC (%)",
+            yaxis_title="Frequency",
+            bargap=0.1
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.info(f"**Simulation Results:** This company creates value (ROIC > Cost of Capital) in **{res['value_creation_prob']*100:.1f}%** of scenarios.")
+
+    with tab4:
+        st.markdown("### 📖 Model Glossary")
+        st.markdown("""
+        **Default Risk (p_def):**
+        Probability of technical insolvency within 12 months, calibrated for emerging markets using:
+        - Net Debt/EBITDA ratio
+        - Interest coverage ratio
+        - Country risk premium
+
+        **Z-Score:**
+        Altman's bankruptcy predictor (modified for emerging markets):
+        - >2.6: Safe Zone
+        - 1.8-2.6: Grey Zone
+        - <1.8: Distress Zone
+
+        **Fair Value:**
+        Market price adjusted for default probability and expected recovery rate:
+        `Fair Value = Price × (1 - p_def × (1 - Recovery Rate))`
+
+        **Value Creation Probability:**
+        Percentage of Monte Carlo simulations where real ROIC exceeds the cost of capital.
+        """)
+
+        st.markdown("### 📑 Audit Trail")
+        if st.session_state.audit_log:
+            audit_df = pd.DataFrame(st.session_state.audit_log)
+            st.dataframe(
+                audit_df[['timestamp', 'field', 'old', 'new', 'diff_pct']],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.caption("No adjustments made in this session")
+
+    # Store results for next run
+    st.session_state.previous_results = res
+
+else:
+    st.error("Failed to fetch data for this ticker. Please try another symbol or check your internet connection.")
+    st.info("Common issues:\n- Ticker may be delisted\n- Market data unavailable\n- API rate limits exceeded")
+
+st.divider()
+st.caption(f"Last sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Quality Score: {data.get('quality_score', 'N/A') if data else 'N/A'}%")/
