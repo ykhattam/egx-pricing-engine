@@ -448,4 +448,4 @@ else:
     st.info("Common issues:\n- Ticker may be delisted\n- Market data unavailable\n- API rate limits exceeded")
 
 st.divider()
-st.caption(f"Last sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Quality Score: {data.get('quality_score', 'N/A') if data else 'N/A'}%")/
+st.caption(f"Last sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Quality Score: {data.get('quality_score', 'N/A') if data else 'N/A'}%")
